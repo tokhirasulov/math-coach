@@ -1,9 +1,4 @@
-import {
-  ApiError,
-  FinishReason,
-  GoogleGenAI,
-  type GenerateContentResponse,
-} from "@google/genai";
+import OpenAI from "openai";
 import { COACH_SYSTEM_PROMPT } from "@/lib/systemPrompt";
 
 export const runtime = "nodejs";
@@ -26,62 +21,53 @@ function isValidMessages(value: unknown): value is IncomingMessage[] {
   );
 }
 
-function toGeminiContents(messages: IncomingMessage[]) {
-  return messages.map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
-  }));
+// Keep the original problem + the most recent 8 messages to stay under TPM.
+function trimHistory(messages: IncomingMessage[]): IncomingMessage[] {
+  if (messages.length <= 9) return messages;
+  return [messages[0], ...messages.slice(-8)];
 }
 
-const RETRYABLE_STATUSES = new Set([429, 503]);
+function buildOpenAIMessages(
+  messages: IncomingMessage[],
+): OpenAI.ChatCompletionMessageParam[] {
+  return [
+    { role: "system", content: COACH_SYSTEM_PROMPT },
+    ...trimHistory(messages).map((m) => ({
+      role: m.role as "user" | "assistant",
+      content: m.content,
+    })),
+  ];
+}
 
-async function startStreamWithRetry(
-  client: GoogleGenAI,
-  contents: ReturnType<typeof toGeminiContents>,
-): Promise<AsyncGenerator<GenerateContentResponse>> {
-  const delays = [500, 1500, 4000]; // up to 3 retries
+async function createStreamWithRetry(
+  client: OpenAI,
+  openaiMessages: OpenAI.ChatCompletionMessageParam[],
+): Promise<ReturnType<typeof client.chat.completions.stream>> {
+  const delays = [600, 2000, 5000];
 
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
-      return await client.models.generateContentStream({
-        model: "gemini-2.5-flash",
-        contents,
-        config: {
-          systemInstruction: COACH_SYSTEM_PROMPT,
-          maxOutputTokens: 1024,
-        },
+      return client.chat.completions.stream({
+        model: "llama-3.3-70b-versatile",
+        messages: openaiMessages,
+        max_tokens: 1024,
+        stream: true,
       });
     } catch (err) {
-      const status = err instanceof ApiError ? err.status : undefined;
+      const status =
+        err instanceof OpenAI.APIError ? err.status : undefined;
       const isLast = attempt === delays.length;
-      if (!status || !RETRYABLE_STATUSES.has(status) || isLast) {
-        throw err;
-      }
+      if (status !== 429 || isLast) throw err;
       await new Promise((r) => setTimeout(r, delays[attempt]));
     }
   }
-  // Unreachable, but satisfies the type checker.
-  throw new Error("Exhausted retries without throwing.");
-}
-
-function finishMessageFor(reason: FinishReason | undefined): string | null {
-  switch (reason) {
-    case FinishReason.SAFETY:
-    case FinishReason.PROHIBITED_CONTENT:
-    case FinishReason.BLOCKLIST:
-    case FinishReason.RECITATION:
-      return "\n\n_The coach's reply was cut off by a safety filter. Try rephrasing your last message._";
-    case FinishReason.MAX_TOKENS:
-      return "\n\n_(reply truncated — ask me to continue)_";
-    default:
-      return null;
-  }
+  throw new Error("Exhausted retries.");
 }
 
 export async function POST(request: Request) {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
-    return new Response("Server is missing GEMINI_API_KEY.", { status: 500 });
+    return new Response("Server is missing GROQ_API_KEY.", { status: 500 });
   }
 
   let body: unknown;
@@ -96,17 +82,21 @@ export async function POST(request: Request) {
     return new Response("Invalid messages payload.", { status: 400 });
   }
 
-  const client = new GoogleGenAI({ apiKey });
-  const contents = toGeminiContents(messages);
+  const client = new OpenAI({
+    apiKey,
+    baseURL: "https://api.groq.com/openai/v1",
+  });
 
-  let geminiStream: AsyncGenerator<GenerateContentResponse>;
+  const openaiMessages = buildOpenAIMessages(messages);
+
+  let groqStream: ReturnType<typeof client.chat.completions.stream>;
   try {
-    geminiStream = await startStreamWithRetry(client, contents);
+    groqStream = await createStreamWithRetry(client, openaiMessages);
   } catch (err) {
-    const status = err instanceof ApiError ? err.status : 500;
+    const status = err instanceof OpenAI.APIError ? err.status : 500;
     const friendly =
       status === 429
-        ? "The coach is at its free-tier rate limit right now. Give it a moment and try again."
+        ? "The coach is at its rate limit right now. Give it a moment and try again."
         : "The coach is unavailable right now. Please try again.";
     return new Response(friendly, { status: status === 429 ? 429 : 502 });
   }
@@ -115,45 +105,35 @@ export async function POST(request: Request) {
   const readable = new ReadableStream<Uint8Array>({
     async start(controller) {
       let receivedAnyText = false;
-      let finishReason: FinishReason | undefined;
-      let blockReason: string | undefined;
-
       try {
-        for await (const chunk of geminiStream) {
-          const text = chunk.text;
+        for await (const chunk of groqStream) {
+          const text = chunk.choices[0]?.delta?.content;
           if (text) {
             receivedAnyText = true;
             controller.enqueue(encoder.encode(text));
           }
-          const candidateFinish = chunk.candidates?.[0]?.finishReason;
-          if (candidateFinish) finishReason = candidateFinish;
-          const pf = chunk.promptFeedback?.blockReason;
-          if (pf) blockReason = String(pf);
         }
-
-        const trailing = finishMessageFor(finishReason);
-        if (trailing) controller.enqueue(encoder.encode(trailing));
-
         if (!receivedAnyText) {
-          const note = blockReason
-            ? `_Your last message was blocked by a safety filter (${blockReason}). Try rephrasing it._`
-            : "_The coach didn't have anything to say. Try rephrasing your last message._";
-          controller.enqueue(encoder.encode(note));
+          controller.enqueue(
+            encoder.encode(
+              "_The coach didn't have anything to say. Try rephrasing your last message._",
+            ),
+          );
         }
-
         controller.close();
       } catch (err) {
         const message =
           err instanceof Error ? err.message : "Unknown streaming error";
         try {
-          controller.enqueue(
-            encoder.encode(`\n\n[Coach error: ${message}]`),
-          );
+          controller.enqueue(encoder.encode(`\n\n[Coach error: ${message}]`));
         } catch {
           // already closed
         }
         controller.error(err);
       }
+    },
+    cancel() {
+      groqStream.controller.abort();
     },
   });
 
