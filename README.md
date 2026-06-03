@@ -28,13 +28,19 @@ Free tier: 30 requests/min, 14,400/day, ~6,000 tokens/min. Plenty for a small va
    npm install
    ```
 
-2. Create `.env.local` in the project root with your Groq API key:
+2. Create `.env.local` in the project root:
 
    ```
    GROQ_API_KEY=your-key-from-console.groq.com
+
+   # PostHog analytics (posthog.com — free tier)
+   NEXT_PUBLIC_POSTHOG_KEY=phc_...
+   NEXT_PUBLIC_POSTHOG_HOST=https://us.i.posthog.com
    ```
 
-   (See `.env.example`.)
+   (See `.env.example`.) The `NEXT_PUBLIC_` prefix lets the browser read those values; they are not secret.
+
+   PostHog autocaptures **pageviews** (visits over time), **session duration** (via pageleave), and **returning visitor identity** using its own anonymous persistent ID — no names or emails are collected. Session replay is enabled with all text inputs masked. Two custom events are also fired: `coaching_session_started` (first message of a session) and `message_sent` (every student message, useful for measuring engagement depth).
 
 3. Start the dev server:
 

@@ -10,6 +10,7 @@ import {
 } from "react";
 import { v4 as uuid } from "uuid";
 import { CoachMessage } from "./CoachMessage";
+import { usePostHog } from "posthog-js/react";
 import { type Lang, LANG_KEY, LANGS, UI } from "@/lib/translations";
 
 type Role = "user" | "assistant";
@@ -64,6 +65,7 @@ export function Chat() {
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const posthog = usePostHog();
 
   useEffect(() => {
     ensureSessionId();
@@ -102,6 +104,13 @@ export function Chat() {
       if (!trimmed || streaming) return;
 
       setError(null);
+
+      // Fire analytics events before mutating state so message count is still accurate
+      if (messages.length === 0) {
+        posthog?.capture("coaching_session_started");
+      }
+      posthog?.capture("message_sent", { session_message_index: messages.length });
+
       const userMsg: ChatMessage = { id: uuid(), role: "user", content: trimmed };
       const assistantMsg: ChatMessage = { id: uuid(), role: "assistant", content: "" };
 
