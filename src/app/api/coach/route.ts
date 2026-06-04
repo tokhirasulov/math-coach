@@ -1,8 +1,11 @@
-import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import { COACH_SYSTEM_PROMPT } from "@/lib/systemPrompt";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const MODEL = "claude-sonnet-4-6";
+const MAX_TOKENS = 1024;
 
 type IncomingMessage = {
   role: "user" | "assistant";
@@ -27,35 +30,59 @@ function trimHistory(messages: IncomingMessage[]): IncomingMessage[] {
   return [messages[0], ...messages.slice(-8)];
 }
 
-function buildOpenAIMessages(
+// Anthropic's `messages` array holds ONLY the conversation (user/assistant
+// turns). The system prompt is passed separately as a top-level parameter.
+function buildAnthropicMessages(
   messages: IncomingMessage[],
-): OpenAI.ChatCompletionMessageParam[] {
-  return [
-    { role: "system", content: COACH_SYSTEM_PROMPT },
-    ...trimHistory(messages).map((m) => ({
-      role: m.role as "user" | "assistant",
-      content: m.content,
-    })),
-  ];
+): Anthropic.MessageParam[] {
+  return trimHistory(messages).map((m) => ({
+    role: m.role,
+    content: m.content,
+  }));
 }
 
-async function createStreamWithRetry(
-  client: OpenAI,
-  openaiMessages: OpenAI.ChatCompletionMessageParam[],
-): Promise<ReturnType<typeof client.chat.completions.stream>> {
+// The system prompt is identical on every call, so cache it to cut cost.
+const SYSTEM_PROMPT_BLOCKS: Anthropic.TextBlockParam[] = [
+  {
+    type: "text",
+    text: COACH_SYSTEM_PROMPT,
+    cache_control: { type: "ephemeral" },
+  },
+];
+
+type StartedStream = {
+  stream: ReturnType<Anthropic["messages"]["stream"]>;
+  iterator: AsyncIterator<Anthropic.MessageStreamEvent>;
+  first: IteratorResult<Anthropic.MessageStreamEvent>;
+};
+
+// Start the stream and pull the first event so transient HTTP errors (notably
+// 429, common on new accounts with low rate limits) surface before we begin
+// streaming to the client. Retry those with exponential backoff.
+async function startStreamWithRetry(
+  client: Anthropic,
+  messages: Anthropic.MessageParam[],
+): Promise<StartedStream> {
   const delays = [600, 2000, 5000];
 
   for (let attempt = 0; attempt <= delays.length; attempt++) {
+    const stream = client.messages.stream(
+      {
+        model: MODEL,
+        max_tokens: MAX_TOKENS,
+        system: SYSTEM_PROMPT_BLOCKS,
+        messages,
+      },
+      { maxRetries: 0 },
+    );
+
     try {
-      return client.chat.completions.stream({
-        model: "llama-3.3-70b-versatile",
-        messages: openaiMessages,
-        max_tokens: 1024,
-        stream: true,
-      });
+      const iterator = stream[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      return { stream, iterator, first };
     } catch (err) {
-      const status =
-        err instanceof OpenAI.APIError ? err.status : undefined;
+      stream.abort();
+      const status = err instanceof Anthropic.APIError ? err.status : undefined;
       const isLast = attempt === delays.length;
       if (status !== 429 || isLast) throw err;
       await new Promise((r) => setTimeout(r, delays[attempt]));
@@ -64,10 +91,22 @@ async function createStreamWithRetry(
   throw new Error("Exhausted retries.");
 }
 
+function deltaText(event: Anthropic.MessageStreamEvent): string | undefined {
+  if (
+    event.type === "content_block_delta" &&
+    event.delta.type === "text_delta"
+  ) {
+    return event.delta.text;
+  }
+  return undefined;
+}
+
 export async function POST(request: Request) {
-  const apiKey = process.env.GROQ_API_KEY;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return new Response("Server is missing GROQ_API_KEY.", { status: 500 });
+    return new Response("Server is missing ANTHROPIC_API_KEY.", {
+      status: 500,
+    });
   }
 
   let body: unknown;
@@ -82,18 +121,14 @@ export async function POST(request: Request) {
     return new Response("Invalid messages payload.", { status: 400 });
   }
 
-  const client = new OpenAI({
-    apiKey,
-    baseURL: "https://api.groq.com/openai/v1",
-  });
+  const client = new Anthropic({ apiKey });
+  const anthropicMessages = buildAnthropicMessages(messages);
 
-  const openaiMessages = buildOpenAIMessages(messages);
-
-  let groqStream: ReturnType<typeof client.chat.completions.stream>;
+  let started: StartedStream;
   try {
-    groqStream = await createStreamWithRetry(client, openaiMessages);
+    started = await startStreamWithRetry(client, anthropicMessages);
   } catch (err) {
-    const status = err instanceof OpenAI.APIError ? err.status : 500;
+    const status = err instanceof Anthropic.APIError ? err.status : 500;
     const friendly =
       status === 429
         ? "The coach is at its rate limit right now. Give it a moment and try again."
@@ -101,17 +136,20 @@ export async function POST(request: Request) {
     return new Response(friendly, { status: status === 429 ? 429 : 502 });
   }
 
+  const { stream, iterator, first } = started;
   const encoder = new TextEncoder();
   const readable = new ReadableStream<Uint8Array>({
     async start(controller) {
       let receivedAnyText = false;
       try {
-        for await (const chunk of groqStream) {
-          const text = chunk.choices[0]?.delta?.content;
+        let result = first;
+        while (!result.done) {
+          const text = deltaText(result.value);
           if (text) {
             receivedAnyText = true;
             controller.enqueue(encoder.encode(text));
           }
+          result = await iterator.next();
         }
         if (!receivedAnyText) {
           controller.enqueue(
@@ -133,7 +171,7 @@ export async function POST(request: Request) {
       }
     },
     cancel() {
-      groqStream.controller.abort();
+      stream.abort();
     },
   });
 
